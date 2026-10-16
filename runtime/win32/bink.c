@@ -136,7 +136,11 @@ S(_BinkOpen_8) {
     if (b->has_audio) {
         SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, 44100};
         b->as = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
-        if (b->as) { SDL_ResumeAudioStreamDevice(b->as); pthread_create(&b->at, NULL, audio_main, b); }
+        if (b->as) {
+            if (getenv("QUIET")) SDL_SetAudioStreamGain(b->as, 0.f);
+            SDL_ResumeAudioStreamDevice(b->as);
+            pthread_create(&b->at, NULL, audio_main, b);
+        }
     }
     b->t0_us = now_us();
     LOG("[bink] open %s: %dx%d %.2f fps %u frames%s\n", name, b->w, b->h, b->fps, b->frames, b->has_audio ? " +audio" : "");
@@ -192,7 +196,7 @@ S(_BinkPause_8) {
 }
 S(_BinkSetVolume_12) {
     BinkH *b = bk_of(ARG(c, 0));
-    if (b && b->as) SDL_SetAudioStreamGain(b->as, (float)ARG(c, 2) / 32768.f);
+    if (b && b->as && !getenv("QUIET")) SDL_SetAudioStreamGain(b->as, (float)ARG(c, 2) / 32768.f);
     RET(c, 0, 3);
 }
 S(_BinkCopyToBuffer_28) {

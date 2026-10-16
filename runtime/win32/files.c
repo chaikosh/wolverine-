@@ -16,7 +16,13 @@
 typedef struct { int used, fd; char path[1024]; char **names; int nnames, pos; char dir[1024]; } HFile;
 static HFile g_h[MAXH];
 
-static uint32_t h_new(void) { for (int i = 1; i < MAXH; i++) if (!g_h[i].used) { memset(&g_h[i], 0, sizeof g_h[i]); g_h[i].used = 1; g_h[i].fd = -1; return 0x1000u + (uint32_t)i * 4; } return INVALID; }
+static uint32_t h_new(void) {
+    for (int i = 1; i < MAXH; i++)
+        if (!g_h[i].used) { memset(&g_h[i], 0, sizeof g_h[i]); g_h[i].used = 1; g_h[i].fd = -1; return 0x1000u + (uint32_t)i * 4; }
+    LOG("[file] handle table full\n");
+    return INVALID;
+}
+static int h_count(void) { int n = 0; for (int i = 1; i < MAXH; i++) n += g_h[i].used; return n; }
 static HFile *h_get(uint32_t h) { uint32_t i = (h - 0x1000u) / 4; return (h >= 0x1000u && i < MAXH && g_h[i].used) ? &g_h[i] : NULL; }
 const char *file_handle_path(uint32_t h) { HFile *f = h_get(h); return f ? f->path : NULL; }
 static void set_err(CPU *c, uint32_t e) { s32(c->fs_base + 0x34, e); }
@@ -48,6 +54,7 @@ static uint32_t open_file(CPU *c, const char *name, uint32_t access, uint32_t di
     if (fd < 0) { set_err(c, 2); return INVALID; }
     uint32_t h = h_new();
     HFile *f = h_get(h);
+    if (!f) { close(fd); set_err(c, 4); return INVALID; }
     f->fd = fd;
     snprintf(f->path, sizeof f->path, "%s", hp);
     set_err(c, 0);
@@ -95,6 +102,7 @@ S(GetFileSize) {
 }
 S(GetFileType) { uint32_t h = ARG(c, 0); RET(c, (h >= 0x10000u && h <= 0x1000Cu) ? 2 : (h_get(h) ? 1 : 0), 1); }
 S(CloseHandle) {
+    if (getenv("TRACE_HANDLES")) { static int k; if (++k % 200 == 0) LOG("[file] handles in use: %d\n", h_count()); }
     HFile *f = h_get(ARG(c, 0));
     if (f) { if (f->fd >= 0) close(f->fd); for (int i = 0; i < f->nnames; i++) free(f->names[i]); free(f->names); f->used = 0; }
     RET(c, 1, 1);
@@ -113,6 +121,22 @@ S(GetDiskFreeSpaceExA) {
     for (int k = 1; k <= 3; k++) if (ARG(c, k)) { s32(ARG(c, k), 0); s32(ARG(c, k) + 4, 2); }   /* 8 GiB */
     RET(c, 1, 4);
 }
+
+/* Find handles live in their own ring: Wolvie.exe scans the save slots every frame and never calls FindClose,
+   which Windows tolerates; here the oldest search is simply recycled. */
+#define MAXFIND 64
+static HFile g_find[MAXFIND];
+static int g_find_next;
+static uint32_t find_new(void) {
+    int i = g_find_next++ % MAXFIND;
+    HFile *f = &g_find[i];
+    for (int k = 0; k < f->nnames; k++) free(f->names[k]);
+    free(f->names);
+    memset(f, 0, sizeof *f);
+    f->used = 1; f->fd = -1;
+    return 0x8000u + (uint32_t)i * 4;
+}
+static HFile *find_get(uint32_t h) { uint32_t i = (h - 0x8000u) / 4; return (h >= 0x8000u && i < MAXFIND && g_find[i].used) ? &g_find[i] : NULL; }
 
 /* FindFirstFile: WIN32_FIND_DATAA is 320 bytes, name at +44 */
 static void fill_find(HFile *f, uint32_t data) {
@@ -134,8 +158,8 @@ S(FindFirstFileA) {
     if (slash) { snprintf(dir, sizeof dir, "%.*s", (int)(slash - pat), pat); slash++; }
     else { strcpy(dir, "."); slash = pat; }
     host_path(dir, hp, sizeof hp, 1);
-    uint32_t h = h_new();
-    HFile *f = h_get(h);
+    uint32_t h = find_new();
+    HFile *f = find_get(h);
     snprintf(f->dir, sizeof f->dir, "%s", hp);
     DIR *d = opendir(hp);
     if (d) {
@@ -150,18 +174,21 @@ S(FindFirstFileA) {
         closedir(d);
     }
     if (g_trace_imports) LOG("[file] find %s -> %d matches in %s\n", pat, f->nnames, hp);
+    if (getenv("TRACE_HANDLES")) { static int k; if (++k % 100 == 0) LOG("[file] finds=%d handles in use: %d\n", k, h_count()); }
     if (!f->nnames) { f->used = 0; set_err(c, 2); RET(c, INVALID, 2); return; }
     fill_find(f, ARG(c, 1));
     RET(c, h, 2);
 }
 S(FindNextFileA) {
-    HFile *f = h_get(ARG(c, 0));
+    HFile *f = find_get(ARG(c, 0));
     if (!f || f->pos + 1 >= f->nnames) { set_err(c, 18); RET(c, 0, 2); return; }
     f->pos++;
     fill_find(f, ARG(c, 1));
     RET(c, 1, 2);
 }
-S(FindClose) { HFile *f = h_get(ARG(c, 0)); if (f) { for (int i = 0; i < f->nnames; i++) free(f->names[i]); free(f->names); f->used = 0; } RET(c, 1, 1); }
+S(FindClose) {
+    if (getenv("TRACE_HANDLES")) { static int k; if (++k % 100 == 0) LOG("[file] FindClose calls=%d (handle %08X)\n", k, ARG(c, 0)); }
+    HFile *f = find_get(ARG(c, 0)); if (f) { for (int i = 0; i < f->nnames; i++) free(f->names[i]); free(f->names); f->names = NULL; f->nnames = 0; f->used = 0; } RET(c, 1, 1); }
 
 /* File mapping: whole-file copy into guest heap */
 S(CreateFileMappingA) { RET(c, ARG(c, 0) | 0x80000000u, 6); }

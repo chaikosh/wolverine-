@@ -679,15 +679,20 @@ static void update_gamma(Dev *d, MS *m) {
     [m->gamma replaceRegion:MTLRegionMake1D(0, 256) mipmapLevel:0 withBytes:ramp bytesPerRow:sizeof ramp];
 }
 
+/* Test dumps: DUMP_EVERY=n frames, or DUMP_SECS=s for one dump per s seconds (named by time, same clock as AUTOKEYS). */
 static void dump_frame(Dev *d, MS *m) {
-    static int every = -1;
-    if (every < 0) { const char *e = getenv("DUMP_EVERY"); every = e ? atoi(e) : 0; }
-    if (!every || m->frame % (uint64_t)every) return;
+    static int every = -1; static float secs = -1, next;
+    if (every < 0) { const char *e = getenv("DUMP_EVERY"); every = e ? atoi(e) : 0; e = getenv("DUMP_SECS"); secs = e ? strtof(e, NULL) : 0; next = secs; }
+    char name[64];
+    float t = SDL_GetTicks() / 1000.f;
+    if (secs > 0 && t >= next) { next = t + secs; snprintf(name, sizeof name, "t%05.1f", t); }
+    else if (every && m->frame % (uint64_t)every == 0) snprintf(name, sizeof name, "frame_%05llu", m->frame);
+    else return;
     uint32_t w = d->bbw, h = d->bbh;
     uint8_t *px = malloc((size_t)w * h * 4);
     mtl_readback(d, (__bridge void *)m->bb_color, px, w, h);
     char path[1024];
-    snprintf(path, sizeof path, "%s/frame_%05llu.bmp", getenv("DUMP_DIR") ? getenv("DUMP_DIR") : "/tmp", m->frame);
+    snprintf(path, sizeof path, "%s/%s.bmp", getenv("DUMP_DIR") ? getenv("DUMP_DIR") : "/tmp", name);
     FILE *f = fopen(path, "wb");
     if (f) {
         uint32_t sz = 54 + w * h * 4;

@@ -113,7 +113,8 @@ void *plat_create_window(const char *title, int w, int h) {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     g_win = SDL_CreateWindow(title, w, h, SDL_WINDOW_METAL | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_BORDERLESS);
 #else
-    g_win = SDL_CreateWindow(title, w, h, SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    g_win = SDL_CreateWindow(title, w, h, SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+                             (getenv("QUIET") ? SDL_WINDOW_HIDDEN : 0));
 #endif
     if (!g_win) LOG("[sdl] window failed: %s\n", SDL_GetError());
     return g_win;
@@ -194,7 +195,7 @@ static void autokeys(void) {
     static int n = -1; static float at[64], hold[64]; static int key[64]; static int state[64];
     static uint64_t t0;
     if (n < 0) {
-        n = 0; t0 = SDL_GetTicks();
+        n = 0; t0 = 0;
         const char *e = getenv("AUTOKEYS");
         while (e && *e && n < 64) {
             at[n] = strtof(e, (char **)&e); if (*e == ':') e++;
@@ -218,7 +219,7 @@ static void autopad(void) {
     static int n = -1; static float at[64], hold[64]; static int btn[64];
     static uint64_t t0;
     if (n < 0) {
-        n = 0; t0 = SDL_GetTicks();
+        n = 0; t0 = 0;
         const char *e = getenv("AUTOPAD");
         while (e && *e && n < 64) {
             at[n] = strtof(e, (char **)&e); if (*e == ':') e++;

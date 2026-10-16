@@ -77,7 +77,9 @@ static void mix_cb(void *ud, SDL_AudioStream *st, int additional, int total) {
         }
     }
     pthread_mutex_unlock(&g_mix);
-    for (int i = 0; i < frames * 2; i++) out[i] = out[i] > 1 ? 1 : out[i] < -1 ? -1 : out[i];
+    static int quiet = -1;
+    if (quiet < 0) quiet = getenv("QUIET") != NULL;   /* test runs: keep timing, output silence */
+    for (int i = 0; i < frames * 2; i++) out[i] = quiet ? 0.f : out[i] > 1 ? 1 : out[i] < -1 ? -1 : out[i];
     SDL_PutAudioStreamData(st, out, frames * 2 * (int)sizeof(float));
     free(out);
 }
