@@ -1,0 +1,17 @@
+# build outputs and tooling
+build/
+.venv/
+__pycache__/
+.DS_Store
+# game files (user-supplied, never committed)
+X2-Wolverine-s-Revenge_Win_EN_Full-Rip/
+gc/
+*.iso
+*.pkr
+pc_extract/
+deps/*
+!deps/build_deps_ios.sh
+ios/Wolverine.xcodeproj/
+ios/Info-device.plist
+game
+ios/Assets.xcassets/AppIcon.appiconset/icon_1024.png

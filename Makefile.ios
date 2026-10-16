@@ -1,0 +1,67 @@
+# iOS build: make -f Makefile.ios [SDK=iphonesimulator|iphoneos]
+SDK      ?= iphonesimulator
+OPT      ?= -O2
+ifeq ($(SDK),iphonesimulator)
+TARGET   := arm64-apple-ios15.0-simulator
+PLATFORM := iPhoneSimulator
+else
+TARGET   := arm64-apple-ios15.0
+PLATFORM := iPhoneOS
+endif
+DEPS     := deps/ios-$(SDK)
+OUT      := build/ios-$(SDK)
+GEN      := build/wolvie/gen
+GAME_DIR ?= game
+APP      := $(OUT)/Wolverine.app
+
+CC       := xcrun -sdk $(SDK) clang
+CFLAGS   := $(OPT) -g -target $(TARGET) -fno-strict-aliasing -fwrapv -w -Iruntime -I$(GEN) -I$(DEPS)/include
+FRAMEWORKS := Metal QuartzCore UIKit Foundation AVFoundation AudioToolbox CoreAudio CoreGraphics CoreHaptics \
+              CoreMotion GameController CoreBluetooth CoreFoundation OpenGLES UniformTypeIdentifiers CoreMedia CoreVideo CoreHaptics
+LDFLAGS  := -target $(TARGET) -Wl,-export_dynamic -L$(DEPS)/lib -lSDL3 -lavformat -lavcodec -lswscale -lswresample \
+            -lavutil -lm $(addprefix -framework ,$(FRAMEWORKS))
+
+RT_SRC   := $(wildcard runtime/*.c runtime/win32/*.c runtime/d3d8/*.c)
+RT_OBJC  := $(wildcard runtime/*.m runtime/d3d8/*.m)
+GEN_SRC  := $(wildcard $(GEN)/*.c)
+OBJS     := $(patsubst %.c,$(OUT)/obj/%.o,$(RT_SRC)) $(patsubst %.m,$(OUT)/obj/%.o,$(RT_OBJC)) \
+            $(patsubst $(GEN)/%.c,$(OUT)/obj/gen/%.o,$(GEN_SRC))
+
+.PHONY: app install run
+app: $(APP)/Wolverine
+
+$(OUT)/obj/%.o: %.c runtime/*.h runtime/*/*.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OUT)/obj/%.o: %.m runtime/*.h runtime/d3d8/*.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
+$(OUT)/obj/gen/%.o: $(GEN)/%.c runtime/cpu.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(APP)/Wolverine: $(OBJS) ios/Info.plist
+	@mkdir -p $(APP)
+	$(CC) $(LDFLAGS) -o $@ $(OBJS)
+	sed 's/__PLATFORM__/$(PLATFORM)/' ios/Info.plist > $(APP)/Info.plist
+	cp build/wolvie/image.bin $(APP)/image.bin
+	@if [ ! -d "$(APP)/game" ]; then mkdir -p "$(APP)/game" && cp -c -R "$(GAME_DIR)/data.pkr" "$(GAME_DIR)/wavs.pkr" "$(GAME_DIR)/movies" "$(GAME_DIR)/music" "$(GAME_DIR)/Wolvie.INI" "$(APP)/game/" && mkdir -p "$(APP)/game/Save"; fi
+	codesign --force --sign - --timestamp=none $(APP)
+	@echo "built $(APP) ($$(du -sh $(APP) | cut -f1))"
+
+# ---- device packaging for Xcode: static library + staged game data (APFS clones, no extra disk)
+LIB := $(OUT)/libwolvie.a
+.PHONY: lib stage xcode
+lib: $(LIB)
+$(LIB): $(OBJS)
+	rm -f $@
+	libtool -static -o $@ $(OBJS)
+	@echo "built $@ ($$(du -sh $@ | cut -f1))"
+
+stage:
+	.venv/bin/python ios/make_icon.py "$(GAME_DIR)/x2icon.ico" ios/Assets.xcassets/AppIcon.appiconset/icon_1024.png
+	@if [ ! -d build/ios-game/game ]; then mkdir -p build/ios-game/game && cp -c -R "$(GAME_DIR)/data.pkr" "$(GAME_DIR)/wavs.pkr" "$(GAME_DIR)/movies" "$(GAME_DIR)/music" "$(GAME_DIR)/Wolvie.INI" build/ios-game/game/ && mkdir -p build/ios-game/game/Save && touch build/ios-game/game/Save/.keep; fi
+	cp build/wolvie/image.bin build/ios-game/image.bin
+
+xcode: stage
+	cd ios && xcodegen generate --quiet && echo "generated ios/Wolverine.xcodeproj"
