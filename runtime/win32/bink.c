@@ -1,6 +1,7 @@
 /* binkw32.dll replacement on FFmpeg: video decoded on demand, audio streamed by a thread into SDL3. */
 #include "win32.h"
 #include "../d3d8/d3d8_int.h"
+#include "../savestate.h"
 #include <SDL3/SDL.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -23,6 +24,7 @@ typedef struct BinkH {
     uint64_t t0_us, pause_us; int paused;
     pthread_t at; volatile int astop; int has_audio;
     SDL_AudioStream *as; float gain;
+    uint32_t flags; double start_sec;   /* for reopening after a quick load */
 } BinkH;
 
 static BinkH *g_bk[64];
@@ -45,6 +47,7 @@ static void *audio_main(void *arg) {
     avformat_find_stream_info(f, NULL);
     int si = av_find_best_stream(f, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     if (si < 0) { avformat_close_input(&f); return NULL; }
+    if (b->start_sec > 0) avformat_seek_file(f, -1, INT64_MIN, (int64_t)(b->start_sec * AV_TIME_BASE), INT64_MAX, 0);
     const AVCodec *codec = avcodec_find_decoder(f->streams[si]->codecpar->codec_id);
     AVCodecContext *d = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(d, f->streams[si]->codecpar);
@@ -87,25 +90,12 @@ static int decode_next(BinkH *b) {
     return avcodec_receive_frame(b->vd, b->fr) == 0;
 }
 
-S(_BinkOpen_8) {
-    uint32_t arg = ARG(c, 0), flags = ARG(c, 1);
-    BinkH *b = calloc(1, sizeof *b);
-    const char *name;
-    if (flags & 0x00800000u) {                    /* BINKFILEHANDLE: arg is a Win32 file handle */
-        const char *hp = file_handle_path(arg);
-        LOG("[bink] open by handle %08X -> %s\n", arg, hp ? hp : "?");
-        if (!hp) { free(b); snprintf(g_err, sizeof g_err, "bad handle"); RET(c, 0, 2); return; }
-        snprintf(b->path, sizeof b->path, "%s", hp);
-        name = b->path;
-    } else {
-        name = gstr(arg);
-        if (!name) { LOG("[bink] open NULL name flags=%08X\n", flags); free(b); RET(c, 0, 2); return; }
-        host_path(name, b->path, sizeof b->path, 1);
-    }
+/* Opens decoders and audio for b->path; 0 on failure. */
+static int bk_open(BinkH *b, const char *name) {
     if (avformat_open_input(&b->vf, b->path, NULL, NULL) < 0) {
         snprintf(g_err, sizeof g_err, "Bink: cannot open %s", name);
         LOG("[bink] open %s FAILED\n", name);
-        free(b); RET(c, 0, 2); return;
+        return 0;
     }
     avformat_find_stream_info(b->vf, NULL);
     b->vs = av_find_best_stream(b->vf, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
@@ -128,37 +118,60 @@ S(_BinkOpen_8) {
         b->bgra = calloc((size_t)b->w * (size_t)b->h, 4);
     }
     b->fr = av_frame_alloc(); b->pk = av_packet_alloc();
-    b->frame = 1; b->gain = 1;
+    if (!b->frame) b->frame = 1;
+    if (b->fps <= 0) b->fps = 30;
     b->has_audio = av_find_best_stream(b->vf, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0) >= 0;
-    b->guest = galloc(512, 1);
-    sync_guest(b);
-    for (int i = 0; i < 64; i++) if (!g_bk[i]) { g_bk[i] = b; break; }
+    b->start_sec = (b->frame - 1) / b->fps;
+    b->t0_us = now_us() - (uint64_t)(b->start_sec * 1e6);
     if (b->has_audio) {
         SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, 44100};
         b->as = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
         if (b->as) {
-            if (getenv("QUIET")) SDL_SetAudioStreamGain(b->as, 0.f);
+            SDL_SetAudioStreamGain(b->as, getenv("QUIET") ? 0.f : b->gain);
             SDL_ResumeAudioStreamDevice(b->as);
             pthread_create(&b->at, NULL, audio_main, b);
         }
     }
-    b->t0_us = now_us();
+    for (int i = 0; i < 64; i++) if (!g_bk[i]) { g_bk[i] = b; break; }
     LOG("[bink] open %s: %dx%d %.2f fps %u frames%s\n", name, b->w, b->h, b->fps, b->frames, b->has_audio ? " +audio" : "");
+    return 1;
+}
+/* Stops audio and frees everything on the host side (the guest struct is the caller's business). */
+static void bk_free_host(BinkH *b) {
+    b->astop = 1;
+    if (b->as) { pthread_join(b->at, NULL); SDL_DestroyAudioStream(b->as); }
+    if (b->vd) avcodec_free_context(&b->vd);
+    if (b->vf) avformat_close_input(&b->vf);
+    if (b->sws) sws_freeContext(b->sws);
+    av_frame_free(&b->fr); av_packet_free(&b->pk);
+    free(b->bgra);
+    for (int i = 0; i < 64; i++) if (g_bk[i] == b) g_bk[i] = NULL;
+    free(b);
+}
+S(_BinkOpen_8) {
+    uint32_t arg = ARG(c, 0), flags = ARG(c, 1);
+    BinkH *b = calloc(1, sizeof *b);
+    const char *name;
+    if (flags & 0x00800000u) {                    /* BINKFILEHANDLE: arg is a Win32 file handle */
+        const char *hp = file_handle_path(arg);
+        LOG("[bink] open by handle %08X -> %s\n", arg, hp ? hp : "?");
+        if (!hp) { free(b); snprintf(g_err, sizeof g_err, "bad handle"); RET(c, 0, 2); return; }
+        snprintf(b->path, sizeof b->path, "%s", hp);
+        name = b->path;
+    } else {
+        name = gstr(arg);
+        if (!name) { LOG("[bink] open NULL name flags=%08X\n", flags); free(b); RET(c, 0, 2); return; }
+        host_path(name, b->path, sizeof b->path, 1);
+    }
+    b->flags = flags; b->gain = 1;
+    if (!bk_open(b, name)) { free(b); RET(c, 0, 2); return; }
+    b->guest = galloc(512, 1);
+    sync_guest(b);
     RET(c, b->guest, 2);
 }
 S(_BinkClose_4) {
     BinkH *b = bk_of(ARG(c, 0));
-    if (b) {
-        b->astop = 1;
-        if (b->as) { pthread_join(b->at, NULL); SDL_DestroyAudioStream(b->as); }
-        if (b->vd) avcodec_free_context(&b->vd);
-        if (b->vf) avformat_close_input(&b->vf);
-        if (b->sws) sws_freeContext(b->sws);
-        av_frame_free(&b->fr); av_packet_free(&b->pk);
-        free(b->bgra); gfree(b->guest);
-        for (int i = 0; i < 64; i++) if (g_bk[i] == b) g_bk[i] = NULL;
-        free(b);
-    }
+    if (b) { uint32_t g = b->guest; bk_free_host(b); gfree(g); }
     RET(c, 0, 1);
 }
 S(_BinkDoFrame_4) {
@@ -196,7 +209,8 @@ S(_BinkPause_8) {
 }
 S(_BinkSetVolume_12) {
     BinkH *b = bk_of(ARG(c, 0));
-    if (b && b->as && !getenv("QUIET")) SDL_SetAudioStreamGain(b->as, (float)ARG(c, 2) / 32768.f);
+    if (b) b->gain = (float)ARG(c, 2) / 32768.f;
+    if (b && b->as && !getenv("QUIET")) SDL_SetAudioStreamGain(b->as, b->gain);
     RET(c, 0, 3);
 }
 S(_BinkCopyToBuffer_28) {
@@ -239,4 +253,38 @@ S(_BinkGetError_0) {
     if (!g_err_guest) g_err_guest = galloc(256, 1);
     snprintf((char *)gptr(g_err_guest), 256, "%s", g_err);
     RET(c, g_err_guest, 0);
+}
+
+/* ---------------------------------------------------------------- save states */
+typedef struct { uint32_t guest, flags, frame; int paused; float gain; char path[1024]; } SSBink;
+void bink_ss_save(SSBuf *b) {
+    for (int i = 0; i < 64; i++) {
+        BinkH *h = g_bk[i];
+        if (!h) continue;
+        SSBink e = {h->guest, h->flags, h->frame, h->paused, h->gain, ""};
+        snprintf(e.path, sizeof e.path, "%s", h->path);
+        int one = 1; SSW(b, one); SSW(b, e);
+    }
+    int end = 0; SSW(b, end);
+}
+void bink_ss_load(SSRd *r) {
+    static SSBink saved[64]; int n = 0, more = 0;
+    while (n < 64 && SSR(r, more) && more == 1 && SSR(r, saved[n])) n++;
+    for (int i = 0; i < 64; i++) {   /* streams opened after the save */
+        BinkH *h = g_bk[i];
+        if (!h) continue;
+        int keep = 0;
+        for (int k = 0; k < n; k++) if (saved[k].guest == h->guest && !strcmp(saved[k].path, h->path)) keep = 1;
+        if (!keep) bk_free_host(h);
+    }
+    for (int k = 0; k < n; k++) {    /* streams closed after the save: reopen at the saved frame */
+        if (bk_of(saved[k].guest)) continue;
+        BinkH *h = calloc(1, sizeof *h);
+        snprintf(h->path, sizeof h->path, "%s", saved[k].path);
+        h->flags = saved[k].flags; h->frame = saved[k].frame; h->gain = saved[k].gain;
+        if (!bk_open(h, h->path)) { free(h); continue; }
+        h->guest = saved[k].guest;
+        if (saved[k].paused) { h->paused = 1; h->pause_us = now_us(); if (h->as) SDL_PauseAudioStreamDevice(h->as); }
+        sync_guest(h);
+    }
 }

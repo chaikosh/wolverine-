@@ -1,5 +1,6 @@
 /* DirectSound 8: software mixer over SDL3 audio. Buffers live in guest memory. */
 #include "../com.h"
+#include "../savestate.h"
 #include <SDL3/SDL.h>
 #include <stdlib.h>
 #include <math.h>
@@ -19,7 +20,8 @@ typedef struct SBuf {
     uint32_t mode3d;
 } SBuf;
 
-static SBuf *g_bufs[MAXBUF];
+static SBuf *g_bufs[MAXBUF];        /* buffers the mixer plays */
+static SBuf **g_all; static int g_nall, g_call;   /* every buffer ever created (structs are kept for save states) */
 static pthread_mutex_t g_mix = PTHREAD_MUTEX_INITIALIZER;
 static SDL_AudioStream *g_stream;
 static uint32_t vt_ds, vt_buf, vt_3d, vt_lis, g_ds_obj;
@@ -98,20 +100,22 @@ static void audio_start(void) {
 M(AddRef) { RET(c, com_addref(THIS), 1); }
 
 /* ---------------------------------------------------------------- buffers */
+static void mix_add(SBuf *s) {
+    for (int i = 0; i < MAXBUF; i++) if (g_bufs[i] == s) return;
+    for (int i = 0; i < MAXBUF; i++) if (!g_bufs[i]) { g_bufs[i] = s; return; }
+    LOG("[dsound] too many live buffers\n");
+}
+static void mix_remove(SBuf *s) { for (int i = 0; i < MAXBUF; i++) if (g_bufs[i] == s) g_bufs[i] = NULL; }
+static int mix_has(SBuf *s) { for (int i = 0; i < MAXBUF; i++) if (g_bufs[i] == s) return 1; return 0; }
 static SBuf *new_buf(void) {
     SBuf *s = calloc(1, sizeof *s);
     s->mind = 1; s->maxd = 1e9f;
     pthread_mutex_lock(&g_mix);
-    for (int i = 0; i < MAXBUF; i++) if (!g_bufs[i]) { g_bufs[i] = s; break; }
+    mix_add(s);
+    if (g_nall == g_call) { g_call = g_call ? g_call * 2 : 256; g_all = realloc(g_all, sizeof(SBuf *) * (size_t)g_call); }
+    g_all[g_nall++] = s;
     pthread_mutex_unlock(&g_mix);
     return s;
-}
-static void free_buf(SBuf *s) {
-    pthread_mutex_lock(&g_mix);
-    for (int i = 0; i < MAXBUF; i++) if (g_bufs[i] == s) g_bufs[i] = NULL;
-    pthread_mutex_unlock(&g_mix);
-    if (s->mem) gfree(s->mem);
-    free(s);
 }
 M(B_QueryInterface) {
     SBuf *s = BUF; uint32_t id = g32(ARG(c, 1)), out = ARG(c, 2);
@@ -122,7 +126,15 @@ M(B_QueryInterface) {
 }
 M(B_Release) {
     uint32_t r = com_release(THIS);
-    if (!r && !BUF->primary) { pthread_mutex_lock(&g_mix); BUF->playing = 0; pthread_mutex_unlock(&g_mix); }
+    if (!r && !BUF->primary) {   /* free the mixer slot and the sample memory; the struct stays for save states */
+        SBuf *s = BUF;
+        pthread_mutex_lock(&g_mix);
+        s->playing = 0;
+        mix_remove(s);
+        if (s->mem) gfree(s->mem);
+        s->mem = 0;
+        pthread_mutex_unlock(&g_mix);
+    }
     RET(c, r, 1);
 }
 M(B_GetCaps) { SBuf *s = BUF; uint32_t p = ARG(c, 1); s32(p + 4, 0x8 | 0x80); s32(p + 8, s->size); RET(c, HR_OK, 2); }
@@ -258,6 +270,29 @@ M(DS_Compact) { RET(c, HR_OK, 1); }
 M(DS_GetSpeakerConfig) { s32(ARG(c, 1), 4); RET(c, HR_OK, 2); }
 M(DS_SetSpeakerConfig) { RET(c, HR_OK, 2); }
 M(DS_Initialize) { RET(c, HR_OK, 2); }
+
+/* ---------------------------------------------------------------- save states */
+void ds_ss_lock(int lock) { if (lock) pthread_mutex_lock(&g_mix); else pthread_mutex_unlock(&g_mix); }
+void ds_ss_save(SSBuf *b) {
+    pthread_mutex_lock(&g_mix);
+    SSW(b, g_lis_pos); SSW(b, g_lis_front); SSW(b, g_lis_top); SSW(b, g_rolloff); SSW(b, g_distf);
+    SSW(b, g_nall);
+    for (int i = 0; i < g_nall; i++) { int live = mix_has(g_all[i]); SSW(b, g_all[i]); SSW(b, *g_all[i]); SSW(b, live); }
+    pthread_mutex_unlock(&g_mix);
+}
+void ds_ss_load(SSRd *r) {   /* the caller holds the mixer lock (ds_ss_lock) */
+    SSR(r, g_lis_pos); SSR(r, g_lis_front); SSR(r, g_lis_top); SSR(r, g_rolloff); SSR(r, g_distf);
+    int n = 0;
+    SSR(r, n);
+    for (int i = 0; i < n; i++) {
+        SBuf *p; SBuf saved; int live = 0;
+        SSR(r, p); SSR(r, saved); SSR(r, live);
+        if (i >= g_nall || g_all[i] != p) continue;
+        *p = saved;
+        if (live) mix_add(p); else mix_remove(p);
+    }
+    for (int i = n; i < g_nall; i++) { g_all[i]->playing = 0; mix_remove(g_all[i]); }   /* created after the save */
+}
 
 static void build(void) {
     static const char *const ds_n[] = {"QueryInterface", "AddRef", "Release", "CreateSoundBuffer", "GetCaps", "DuplicateSoundBuffer",

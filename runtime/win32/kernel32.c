@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
+#include "../savestate.h"
 
 #define S(name) void shim_KERNEL32_##name(CPU *c)
 
@@ -154,11 +155,23 @@ S(InterlockedDecrement) {
 
 /* ------------------------------------------------------------ time */
 static uint64_t now_us(void) { struct timeval tv; gettimeofday(&tv, NULL); return (uint64_t)tv.tv_sec * 1000000u + tv.tv_usec; }
-static uint64_t mono_us(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000u + ts.tv_nsec / 1000; }
+static _Atomic int64_t g_time_off;   /* save states: guest clocks continue from the saved moment */
+static uint64_t mono_us(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u + (uint64_t)atomic_load(&g_time_off);
+}
+void k32_time_save(SSBuf *b) { uint64_t t = mono_us(); SSW(b, t); }
+void k32_time_load(SSRd *r) { uint64_t t; if (SSR(r, t)) atomic_fetch_add(&g_time_off, (int64_t)(t - mono_us())); }
 S(GetTickCount) { RET(c, (uint32_t)(mono_us() / 1000), 0); }
 S(QueryPerformanceFrequency) { uint32_t p = ARG(c, 0); s32(p, 1000000); s32(p + 4, 0); RET(c, 1, 1); }
 S(QueryPerformanceCounter) { uint32_t p = ARG(c, 0); uint64_t t = mono_us(); s32(p, (uint32_t)t); s32(p + 4, (uint32_t)(t >> 32)); RET(c, 1, 1); }
-S(Sleep) { usleep(ARG(c, 0) * 1000u); RET(c, 0, 1); }
+static atomic_int g_park_req;
+static void park_point(CPU *c);
+S(Sleep) {
+    if (atomic_load(&g_park_req)) park_point(c);   /* a save/load is waiting for this thread */
+    usleep(ARG(c, 0) * 1000u);
+    RET(c, 0, 1);
+}
 static void put_systime(uint32_t p, int local) {
     time_t t = time(NULL); struct tm tm;
     if (local) localtime_r(&t, &tm); else gmtime_r(&t, &tm);
@@ -281,26 +294,156 @@ typedef struct GThread {
     uint32_t start, param, handle;
     pthread_t pt;
     pthread_mutex_t m; pthread_cond_t cv;
-    int suspended, finished;
+    int slot, suspended, finished;
     uint32_t exit_code;
+    int parked, zombie;          /* save states: stopped at a Sleep call / to be retired on wake-up */
+    uint32_t park_ret;           /* return address of that Sleep call */
 } GThread;
 static GThread *g_threads[64];
 static pthread_mutex_t g_thr_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_next_tid = 0x2000;
+static __thread GThread *tl_self;
 
+static void thread_cleanup(void *arg) {   /* runs on return and on ExitThread: free the slot for new threads */
+    GThread *t = arg;
+    pthread_mutex_lock(&g_thr_lock);
+    if (g_threads[t->slot] == t) g_threads[t->slot] = NULL;
+    pthread_mutex_unlock(&g_thr_lock);
+    pthread_detach(pthread_self());
+    free(t);
+}
 static void *thread_main(void *arg) {
     GThread *t = arg;
+    tl_self = t;
+    pthread_cleanup_push(thread_cleanup, t);
     pthread_mutex_lock(&t->m);
     while (t->suspended) pthread_cond_wait(&t->cv, &t->m);
     pthread_mutex_unlock(&t->m);
-    t->exit_code = rt_call_guest(&t->cpu, t->start, 1, t->param);
+    if (!t->zombie) t->exit_code = rt_call_guest(&t->cpu, t->start, 1, t->param);
     t->finished = 1;
+    pthread_cleanup_pop(1);
     return NULL;
 }
 static GThread *thread_of(uint32_t h) {
     uint32_t i = h - 0x3000u;
     return (h >= 0x3000u && i < 64) ? g_threads[i] : NULL;
 }
+
+/* ---- save states: every other guest thread stops at its next Sleep call and waits there */
+static pthread_mutex_t g_park_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_park_cv = PTHREAD_COND_INITIALIZER;
+static void park_point(CPU *c) {
+    GThread *t = tl_self;
+    if (!t) return;
+    pthread_mutex_lock(&g_park_m);
+    t->park_ret = g32(c->esp);
+    t->parked = 1;
+    pthread_cond_broadcast(&g_park_cv);
+    while (atomic_load(&g_park_req)) pthread_cond_wait(&g_park_cv, &g_park_m);
+    t->parked = 0;
+    int z = t->zombie;
+    pthread_mutex_unlock(&g_park_m);
+    if (z) pthread_exit(NULL);   /* not part of the loaded state */
+}
+int k32_park_others(int timeout_ms) {
+    atomic_store(&g_park_req, 1);
+    struct timespec end; clock_gettime(CLOCK_REALTIME, &end);
+    end.tv_sec += timeout_ms / 1000; end.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (end.tv_nsec >= 1000000000L) { end.tv_sec++; end.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&g_park_m);
+    for (;;) {
+        int pending = 0;
+        pthread_mutex_lock(&g_thr_lock);
+        for (int i = 0; i < 64; i++) {
+            GThread *t = g_threads[i];
+            if (t && t != tl_self && !t->finished && !t->suspended && !t->parked) pending++;
+        }
+        pthread_mutex_unlock(&g_thr_lock);
+        if (!pending) break;
+        struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
+        if (now.tv_sec > end.tv_sec || (now.tv_sec == end.tv_sec && now.tv_nsec >= end.tv_nsec)) {
+            atomic_store(&g_park_req, 0);
+            pthread_cond_broadcast(&g_park_cv);
+            pthread_mutex_unlock(&g_park_m);
+            return 0;
+        }
+        struct timespec w = now; w.tv_nsec += 5000000L;
+        if (w.tv_nsec >= 1000000000L) { w.tv_sec++; w.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_park_cv, &g_park_m, &w);
+    }
+    pthread_mutex_unlock(&g_park_m);
+    return 1;
+}
+void k32_unpark_others(void) {
+    pthread_mutex_lock(&g_park_m);
+    atomic_store(&g_park_req, 0);
+    pthread_cond_broadcast(&g_park_cv);
+    pthread_mutex_unlock(&g_park_m);
+}
+
+#define TCHAIN 64
+typedef struct { uint32_t start, ret, depth; CPU cpu; int nchain; uint32_t chain[TCHAIN][2]; } SSThread;
+static int parked_threads(GThread **out) {
+    int n = 0;
+    for (int i = 0; i < 64; i++) if (g_threads[i] && g_threads[i]->parked && !g_threads[i]->zombie) out[n++] = g_threads[i];
+    return n;
+}
+static void describe(GThread *t, SSThread *s) {
+    memset(s, 0, sizeof *s);
+    s->start = t->start; s->ret = t->park_ret; s->cpu = t->cpu;
+    s->depth = t->cpu.fs_base - t->cpu.esp;            /* the stack ends at the thread's TEB */
+    s->nchain = ss_chain(t->cpu.esp, t->cpu.fs_base, s->chain, TCHAIN);
+}
+void k32_ss_save(SSBuf *b) {
+    GThread *live[64]; int n = parked_threads(live);
+    SSW(b, n);
+    for (int i = 0; i < n; i++) { SSThread s; describe(live[i], &s); SSW(b, s); }
+}
+/* A saved thread can continue in a live one that runs the same code, is stopped at an equivalent Sleep
+   call and has the same call chain above it (the stack itself comes back with guest memory). */
+static int compatible(const SSThread *s, const SSThread *l) {
+    if (s->start != l->start || s->depth != l->depth || s->nchain != l->nchain || !s->nchain) return 0;
+    if (!ss_same_continuation(s->ret, l->ret)) return 0;
+    for (int k = 1; k < s->nchain; k++)
+        if (s->chain[k][0] != l->chain[k][0] || s->chain[k][1] != l->chain[k][1]) return 0;
+    return 1;
+}
+static int match_threads(SSRd *r, GThread **live, int *nlive, SSThread *saved, int *map) {
+    int ns = 0;
+    if (!SSR(r, ns) || ns < 0 || ns > 64) return 0;
+    for (int i = 0; i < ns; i++) if (!SSR(r, saved[i])) return 0;
+    *nlive = parked_threads(live);
+    SSThread ld[64];
+    for (int j = 0; j < *nlive; j++) describe(live[j], &ld[j]);
+    int used[64] = {0};
+    for (int i = 0; i < ns; i++) {
+        map[i] = -1;
+        for (int j = 0; j < *nlive && map[i] < 0; j++) if (!used[j] && compatible(&saved[i], &ld[j])) { map[i] = j; used[j] = 1; }
+        if (map[i] < 0) { LOG("[ss] load refused: no running thread can continue saved thread start=%08X ret=%08X\n", saved[i].start, saved[i].ret); return 0; }
+    }
+    return ns + 1;
+}
+/* Matching reads the live threads' stacks, so it runs before guest memory is replaced; load applies it. */
+static struct { int ns, nlive, map[64]; GThread *live[64]; SSThread saved[64]; } g_match;
+int k32_ss_check(SSRd r) {
+    pthread_mutex_lock(&g_thr_lock);
+    int ok = match_threads(&r, g_match.live, &g_match.nlive, g_match.saved, g_match.map);
+    g_match.ns = ok ? ok - 1 : -1;
+    pthread_mutex_unlock(&g_thr_lock);
+    return ok;
+}
+void k32_ss_load(SSRd *r) {
+    (void)r;
+    if (g_match.ns < 0) return;
+    pthread_mutex_lock(&g_thr_lock);
+    int keep[64] = {0};
+    for (int i = 0; i < g_match.ns; i++) { g_match.live[g_match.map[i]]->cpu = g_match.saved[i].cpu; keep[g_match.map[i]] = 1; }
+    for (int j = 0; j < g_match.nlive; j++)
+        if (!keep[j]) { g_match.live[j]->zombie = 1; LOG("[ss] retiring thread start=%08X\n", g_match.live[j]->start); }
+    g_match.ns = -1;
+    pthread_mutex_unlock(&g_thr_lock);
+}
+
 S(CreateThread) {
     uint32_t stack = ARG(c, 1) ? ARG(c, 1) : 0x100000u, start = ARG(c, 2), param = ARG(c, 3), flags = ARG(c, 4), ptid = ARG(c, 5);
     if (stack < 0x40000u) stack = 0x40000u;
@@ -309,6 +452,7 @@ S(CreateThread) {
     for (int i = 0; i < 64; i++) if (!g_threads[i]) { slot = i; break; }
     if (slot < 0) { pthread_mutex_unlock(&g_thr_lock); RET(c, 0, 6); return; }
     GThread *t = calloc(1, sizeof *t);
+    t->slot = slot;
     g_threads[slot] = t;
     uint32_t tid = g_next_tid += 4;
     pthread_mutex_unlock(&g_thr_lock);

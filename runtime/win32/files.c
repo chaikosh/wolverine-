@@ -1,5 +1,6 @@
 /* KERNEL32 file system, file mapping, INI and resource shims. */
 #include "win32.h"
+#include "../savestate.h"
 #include <stdlib.h>
 #include <ctype.h>
 #include <unistd.h>
@@ -13,7 +14,7 @@
 #define INVALID 0xFFFFFFFFu
 #define MAXH 1024
 
-typedef struct { int used, fd; char path[1024]; char **names; int nnames, pos; char dir[1024]; } HFile;
+typedef struct { int used, fd, oflags; char path[1024]; char **names; int nnames, pos; char dir[1024]; } HFile;
 static HFile g_h[MAXH];
 
 static uint32_t h_new(void) {
@@ -56,10 +57,52 @@ static uint32_t open_file(CPU *c, const char *name, uint32_t access, uint32_t di
     HFile *f = h_get(h);
     if (!f) { close(fd); set_err(c, 4); return INVALID; }
     f->fd = fd;
+    f->oflags = fl & ~(O_CREAT | O_TRUNC | O_EXCL);   /* how to reopen it after a quick load */
     snprintf(f->path, sizeof f->path, "%s", hp);
     set_err(c, 0);
     return h;
 }
+/* Save states: open files come back with the same handle, path and position. */
+void files_ss_save(SSBuf *b) {
+    for (int i = 1; i < MAXH; i++) {
+        HFile *f = &g_h[i];
+        if (!f->used || f->fd < 0) continue;
+        int64_t pos = lseek(f->fd, 0, SEEK_CUR);
+        uint16_t len = (uint16_t)strlen(f->path);
+        SSW(b, i); SSW(b, f->oflags); SSW(b, pos); SSW(b, len); ssw(b, f->path, len);
+    }
+    int end = 0; SSW(b, end);
+}
+static void h_close(HFile *f) {
+    if (f->fd >= 0) close(f->fd);
+    for (int k = 0; k < f->nnames; k++) free(f->names[k]);
+    free(f->names);
+    memset(f, 0, sizeof *f);
+    f->fd = -1;
+}
+void files_ss_load(SSRd *r) {
+    static char want[MAXH];
+    memset(want, 0, sizeof want);
+    for (;;) {
+        int i = 0, oflags = 0; int64_t pos = 0; uint16_t len = 0; char path[1024];
+        if (!SSR(r, i) || i <= 0 || i >= MAXH) break;
+        SSR(r, oflags); SSR(r, pos); SSR(r, len);
+        if (len >= sizeof path || !ssr(r, path, len)) break;
+        path[len] = 0;
+        HFile *f = &g_h[i];
+        want[i] = 1;
+        if (!(f->used && f->fd >= 0 && !strcmp(f->path, path))) {
+            if (f->used) h_close(f);
+            f->fd = open(path, oflags);
+            if (f->fd < 0) { LOG("[ss] could not reopen %s\n", path); continue; }
+            f->used = 1; f->oflags = oflags;
+            snprintf(f->path, sizeof f->path, "%s", path);
+        }
+        lseek(f->fd, pos, SEEK_SET);
+    }
+    for (int i = 1; i < MAXH; i++) if (!want[i] && g_h[i].used && g_h[i].fd >= 0) h_close(&g_h[i]);   /* opened after the save */
+}
+
 S(CreateFileA) { RET(c, open_file(c, gstr(ARG(c, 0)), ARG(c, 1), ARG(c, 4)), 7); }
 S(CreateFileW) {
     char n[1024]; uint32_t p = ARG(c, 0); int i = 0;

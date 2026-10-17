@@ -10,6 +10,7 @@
 
 static uint32_t g_bump = GUEST_HEAP_BASE, g_vbump = GUEST_VA_BASE;
 static uint32_t g_free[NCLASS];
+_Static_assert(sizeof(((GHeapState *)0)->free_lists) == sizeof g_free, "GHeapState free list size");
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t class_of(uint32_t size, uint32_t *cap) {
@@ -76,6 +77,20 @@ uint32_t gvalloc(uint32_t size) {
     if (p + size > GUEST_VA_END) p = 0; else g_vbump += size;
     pthread_mutex_unlock(&g_lock);
     return p;   /* fresh anonymous memory is already zero */
+}
+
+/* Allocator state for save states: bump pointers and free lists (block headers live in guest memory). */
+void gheap_get_state(GHeapState *st) {
+    pthread_mutex_lock(&g_lock);
+    st->bump = g_bump; st->vbump = g_vbump;
+    memcpy(st->free_lists, g_free, sizeof g_free);
+    pthread_mutex_unlock(&g_lock);
+}
+void gheap_set_state(const GHeapState *st) {
+    pthread_mutex_lock(&g_lock);
+    g_bump = st->bump; g_vbump = st->vbump;
+    memcpy(g_free, st->free_lists, sizeof g_free);
+    pthread_mutex_unlock(&g_lock);
 }
 
 uint32_t gstrdup(const char *s) {

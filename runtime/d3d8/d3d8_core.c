@@ -1,5 +1,6 @@
 /* Direct3D 8 COM surface: IDirect3D8, device state, resources. Rendering lives in d3d8_metal.m. */
 #include "d3d8_int.h"
+#include "../savestate.h"
 #include <stdlib.h>
 #include <math.h>
 
@@ -114,8 +115,18 @@ static void fill_caps(uint32_t p) {
 M(D3D_GetDeviceCaps) { fill_caps(ARG(c, 3)); RET(c, HR_OK, 4); }
 M(D3D_GetAdapterMonitor) { RET(c, 1, 2); }
 
+/* Every resource ever created, in creation order. Host structs are never freed, so a save state can
+   find the same objects again and only has to restore their fields (and Metal textures). */
+typedef struct { void **p; int n, cap; } Reg;
+static Reg g_rtex, g_rsurf, g_rbuf;
+static void *reg(Reg *r, void *p) {
+    if (r->n == r->cap) { r->cap = r->cap ? r->cap * 2 : 1024; r->p = realloc(r->p, sizeof(void *) * (size_t)r->cap); }
+    r->p[r->n++] = p;
+    return p;
+}
+
 static uint32_t new_surface(int kind, uint32_t w, uint32_t h, uint32_t fmt) {
-    Surf *s = calloc(1, sizeof *s);
+    Surf *s = reg(&g_rsurf, calloc(1, sizeof(Surf)));
     s->kind = kind; s->w = w; s->h = h; s->fmt = fmt;
     s->obj = com_new(vt_surf, s);
     return s->obj;
@@ -251,7 +262,11 @@ M(Dev_SetCursorProperties) { RET(c, HR_OK, 4); }
 M(Dev_SetCursorPosition) { RET(c, 0, 4); }
 M(Dev_ShowCursor) { RET(c, 0, 2); }
 M(Dev_Reset) { LOG("[d3d] Reset\n"); RET(c, HR_OK, 2); }
-M(Dev_Present) { mtl_present(DEV); RET(c, HR_OK, 5); }
+M(Dev_Present) {
+    mtl_present(DEV);
+    ss_present(c);   /* quick save / quick load happen between frames */
+    RET(c, HR_OK, 5);
+}
 M(Dev_GetBackBuffer) { s32(ARG(c, 3), DEV->backbuf_surf); com_addref(DEV->backbuf_surf); RET(c, HR_OK, 4); }
 M(Dev_GetRasterStatus) { s32(ARG(c, 1), 1); s32(ARG(c, 1) + 4, 0); RET(c, HR_OK, 2); }
 M(Dev_SetGammaRamp) { memcpy(DEV->gamma, gptr(ARG(c, 2)), 3 * 256 * 2); RET(c, 0, 3); }
@@ -259,7 +274,7 @@ M(Dev_GetGammaRamp) { memcpy(gptr(ARG(c, 1)), DEV->gamma, 3 * 256 * 2); RET(c, 0
 
 extern char g_cur_load[256];
 static uint32_t create_texture(Dev *d, uint32_t w, uint32_t h, uint32_t levels, uint32_t usage, uint32_t fmt, uint32_t pool, int cube) {
-    Tex *t = calloc(1, sizeof *t);
+    Tex *t = reg(&g_rtex, calloc(1, sizeof(Tex)));
     uint32_t maxl = 1, mw = w, mh = h;
     while (mw > 1 || mh > 1) { mw = mw > 1 ? mw / 2 : 1; mh = mh > 1 ? mh / 2 : 1; maxl++; }
     if (!levels || levels > maxl) levels = maxl;
@@ -281,7 +296,7 @@ M(Dev_CreateCubeTexture) {
     RET(c, HR_OK, 7);
 }
 static uint32_t create_buffer(uint32_t vt, uint32_t len, uint32_t usage, uint32_t fmt_or_fvf, uint32_t pool, int index) {
-    Buf *b = calloc(1, sizeof *b);
+    Buf *b = reg(&g_rbuf, calloc(1, sizeof(Buf)));
     b->size = len; b->usage = usage; b->pool = pool;
     if (index) b->fmt = fmt_or_fvf; else b->fvf = fmt_or_fvf;
     b->mem = galloc(len + 16, 1);
@@ -640,7 +655,7 @@ static void level_desc(Tex *t, uint32_t l, uint32_t p) {
 M(Tex_GetLevelDesc) { level_desc(com_host(THIS), ARG(c, 1), ARG(c, 2)); RET(c, HR_OK, 3); }
 static uint32_t tex_surface(Tex *t, int face, uint32_t l) {
     if (!t->surf[face][l]) {
-        Surf *s = calloc(1, sizeof *s);
+        Surf *s = reg(&g_rsurf, calloc(1, sizeof(Surf)));
         s->kind = 0; s->tex = t; s->face = face; s->level = (int)l;
         s->w = lvl_dim(t->w, l); s->h = lvl_dim(t->h, l); s->fmt = t->fmt; s->usage = t->usage;
         s->obj = com_new(vt_surf, s);
@@ -805,4 +820,88 @@ void shim_D3D8_Direct3DCreate8(CPU *c) {
     if (!g_d3d_obj) g_d3d_obj = com_new(vt_d3d, NULL);
     LOG("[d3d] Direct3DCreate8(%u) -> %08X\n", ARG(c, 0), g_d3d_obj);
     RET(c, g_d3d_obj, 1);
+}
+
+/* ===================================================================== save states */
+static void save_reg(SSBuf *b, Reg *r, size_t sz) {
+    SSW(b, r->n);
+    for (int i = 0; i < r->n; i++) { SSW(b, r->p[i]); ssw(b, r->p[i], sz); }
+}
+void d3d_ss_save(SSBuf *b) {
+    int has = g_dev != NULL;
+    SSW(b, has);
+    if (has) SSW(b, *g_dev);
+    save_reg(b, &g_rtex, sizeof(Tex));
+    save_reg(b, &g_rsurf, sizeof(Surf));
+    save_reg(b, &g_rbuf, sizeof(Buf));
+    SSW(b, g_nsb);
+    for (int t = 0; t < 1024; t++) {
+        if (!g_sb[t]) continue;
+        SSW(b, t); SSW(b, g_sb[t]->n);
+        ssw(b, g_sb[t]->e, sizeof(SBEntry) * (size_t)g_sb[t]->n);
+    }
+    int end = -1; SSW(b, end);
+}
+void d3d_ss_load(SSRd *r) {
+    int has = 0;
+    SSR(r, has);
+    if (has) { Dev saved; SSR(r, saved); if (g_dev) { void *metal = g_dev->metal; *g_dev = saved; g_dev->metal = metal; } }
+    int n = 0, uploads = 0;
+    /* textures: fields come back; a texture released after the save gets a new Metal texture, and any
+       texture whose pixels changed is re-uploaded from its staging copy (restored with guest memory) */
+    SSR(r, n);
+    for (int i = 0; i < n; i++) {
+        void *p; Tex saved; SSR(r, p); SSR(r, saved);
+        if (i >= g_rtex.n || g_rtex.p[i] != p) continue;
+        Tex *t = p;
+        void *m = t->mtl; uint32_t gen = t->gen;
+        *t = saved; t->mtl = m;
+        int up = gen != saved.gen;
+        if (!t->mtl && saved.mtl) {
+            t->mtl = mtl_new_texture(g_dev, t->w, t->h, t->levels, t->fmt, (t->usage & D3DUSAGE_RENDERTARGET) != 0,
+                                     (t->usage & D3DUSAGE_DEPTHSTENCIL) != 0, t->cube);
+            up = 1;
+        }
+        if (up && t->mtl) {
+            for (int f = 0; f < (t->cube ? 6 : 1); f++)
+                for (uint32_t l = 0; l < t->levels && l < 16; l++) if (t->lock[f][l]) { mtl_upload(g_dev, t, f, (int)l); uploads++; }
+        }
+    }
+    for (int i = n; i < g_rtex.n; i++) {   /* created after the save: nothing refers to them any more */
+        Tex *t = g_rtex.p[i];
+        if (t->mtl) { mtl_release(t->mtl); t->mtl = NULL; }
+        memset(t->lock, 0, sizeof t->lock);
+    }
+    SSR(r, n);
+    for (int i = 0; i < n; i++) {
+        void *p; Surf saved; SSR(r, p); SSR(r, saved);
+        if (i >= g_rsurf.n || g_rsurf.p[i] != p) continue;
+        Surf *s = p; void *m = s->mtl;
+        *s = saved; s->mtl = m;
+    }
+    for (int i = n; i < g_rsurf.n; i++) {
+        Surf *s = g_rsurf.p[i];
+        if ((s->kind == 2 || s->kind == 4) && s->mtl) { mtl_release(s->mtl); s->mtl = NULL; }
+    }
+    SSR(r, n);
+    for (int i = 0; i < n; i++) {
+        void *p; Buf saved; SSR(r, p); SSR(r, saved);
+        if (i < g_rbuf.n && g_rbuf.p[i] == p) *(Buf *)p = saved;
+    }
+    /* state blocks: replace the current set with the saved one */
+    int nsb = 0;
+    SSR(r, nsb);
+    for (int t = 0; t < 1024; t++) if (g_sb[t]) { free(g_sb[t]->e); free(g_sb[t]); g_sb[t] = NULL; }
+    for (;;) {
+        int t = -1, cnt = 0;
+        if (!SSR(r, t) || t < 0 || t >= 1024 || !SSR(r, cnt) || cnt < 0) break;
+        StateBlock *b = calloc(1, sizeof *b);
+        b->n = b->cap = cnt;
+        b->e = malloc(sizeof(SBEntry) * (size_t)(cnt ? cnt : 1));
+        ssr(r, b->e, sizeof(SBEntry) * (size_t)cnt);
+        g_sb[t] = b;
+    }
+    if (nsb > g_nsb) g_nsb = nsb;   /* never hand out a token the loaded state may still hold */
+    if (g_dev) mtl_set_rendertarget(g_dev);
+    LOG("[ss] d3d: %d textures, %d surfaces, %d buffers restored, %d texture levels re-uploaded\n", g_rtex.n, g_rsurf.n, g_rbuf.n, uploads);
 }

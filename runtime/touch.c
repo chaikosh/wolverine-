@@ -2,14 +2,17 @@
    each button showing a pictogram of what it does. */
 #include "touch.h"
 #include "icons.h"
+#include "savestate.h"
+#include "haptics.h"
 #include "platform.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <TargetConditionals.h>
 
 /* Pad button numbers match SDL gamepads in platform.c: A0 B1 X2 Y3 LB4 RB5 Back6 Start7 LS8 RS9 LT10 RT11 */
-enum { T_A, T_B, T_X, T_Y, T_LB, T_RB, T_LT, T_RT, T_BACK, T_START, T_RS, NBTN };
+enum { T_A, T_B, T_X, T_Y, T_LB, T_RB, T_LT, T_RT, T_BACK, T_START, T_RS, T_SAVE, T_LOAD, NBTN };
 typedef struct { float x, y, r; int pad_button, toggle, icon; float col[3]; } Btn;   /* units of screen height */
 static Btn g_btn[NBTN];
 static int g_down[NBTN], g_latched[NBTN];
@@ -49,6 +52,8 @@ static void layout(void) {
     g_btn[T_LB]    = (Btn){L + 0.09f, 0.80f, 0.065f, 4, 1, ICON_STEALTH, {0.85f, 0.85f, 0.85f}};  /* stealth: toggle, left thumb */
     g_btn[T_START] = (Btn){L + 0.05f, 0.09f, 0.050f, 7, 0, ICON_PAUSE, {0.85f, 0.85f, 0.85f}};   /* pause */
     g_btn[T_BACK]  = (Btn){-1.0f, -1.0f, 0.0f, 6, 0, -1, {0.85f, 0.85f, 0.85f}};         /* hidden on touch */
+    g_btn[T_SAVE]  = (Btn){R - 0.19f, 0.09f, 0.050f, -1, 0, ICON_SAVE, {0.85f, 0.85f, 0.85f}};   /* quick save */
+    g_btn[T_LOAD]  = (Btn){R - 0.06f, 0.09f, 0.050f, -1, 0, ICON_LOAD, {0.85f, 0.85f, 0.85f}};   /* quick load: hold */
     g_layout_done = 1;
 }
 
@@ -82,6 +87,18 @@ void touch_event(int type, uint64_t id, float nx, float ny) {
 
 static int16_t axis(float v) { v = v > 1 ? 1 : v < -1 ? -1 : v; return (int16_t)(v * 32767); }
 
+/* Quick save fires on touch; quick load only after a short hold, so a stray tap can't throw progress away. */
+#define LOAD_HOLD 0.5f
+static double g_load_t0; static int g_load_fired, g_ss_btn = T_SAVE;
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec + t.tv_nsec / 1e9; }
+static void ss_buttons(const int *down) {
+    if (down[T_SAVE] && !g_down[T_SAVE]) { ss_request(SS_SAVE); g_ss_btn = T_SAVE; }
+    if (down[T_LOAD]) {
+        if (!g_down[T_LOAD]) { g_load_t0 = now_s(); g_load_fired = 0; }
+        if (!g_load_fired && now_s() - g_load_t0 >= LOAD_HOLD) { ss_request(SS_LOAD); g_load_fired = 1; g_ss_btn = T_LOAD; }
+    }
+}
+
 void touch_apply(void) {
     if (!touch_enabled() || !g_layout_done) return;
     int down[NBTN] = {0};
@@ -95,9 +112,10 @@ void touch_apply(void) {
     }
     if (sx || sy) { g_pad.lx = axis(sx); g_pad.ly = axis(sy); }
     if (cx || cy) { g_pad.rx = axis(cx); g_pad.ry = axis(cy); }
+    ss_buttons(down);
     for (int b = 0; b < NBTN; b++) {
         int on = g_btn[b].toggle ? g_latched[b] : down[b];
-        if (on) g_pad.buttons[g_btn[b].pad_button] = 0x80;
+        if (on && g_btn[b].pad_button >= 0) g_pad.buttons[g_btn[b].pad_button] = 0x80;
         g_down[b] = on;
     }
 }
@@ -106,6 +124,11 @@ int touch_overlay(UIInst *o, int max, float w, float h) {
     if (!touch_enabled()) return 0;
     g_w = w; g_h = h;
     layout();
+    /* quick save/load result: the button flashes green (done) or red (refused), with a tap on the phone */
+    static float last_age = 1e9f;
+    float age; int fb = ss_feedback(&age);
+    if (fb && age < last_age) haptics_play(fb > 0 ? 0.6f : 1.0f, fb > 0 ? 0.08f : 0.35f);
+    last_age = fb ? age : 1e9f;
     int n = 0;
     for (int b = 0; b < NBTN && n < max; b++) {
         if (g_btn[b].r <= 0) continue;
@@ -114,6 +137,11 @@ int touch_overlay(UIInst *o, int max, float w, float h) {
         u->cx = g_btn[b].x * h; u->cy = g_btn[b].y * h; u->r = g_btn[b].r * h; u->pressed = (float)g_down[b];
         u->col[0] = g_btn[b].col[0]; u->col[1] = g_btn[b].col[1]; u->col[2] = g_btn[b].col[2]; u->col[3] = 0.6f;
         u->icon = (float)(g_btn[b].icon + 1);
+        if (b == T_LOAD && g_down[T_LOAD] && !g_load_fired) u->p1 = (float)((now_s() - g_load_t0) / LOAD_HOLD);
+        if ((b == T_SAVE || b == T_LOAD) && fb && age < 1.2f && b == g_ss_btn) {
+            static const float ok[3] = {0.30f, 0.95f, 0.40f}, bad[3] = {1.00f, 0.30f, 0.30f};
+            memcpy(u->col, fb > 0 ? ok : bad, sizeof ok); u->pressed = 1;
+        }
     }
     for (int i = 0; i < MAXT && n + 2 <= max; i++) {   /* floating stick: base + knob */
         if (!g_t[i].used || g_t[i].role != -1) continue;

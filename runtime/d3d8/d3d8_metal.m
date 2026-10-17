@@ -166,6 +166,7 @@ void mtl_release(void *obj) { if (obj) { id o = (__bridge_transfer id)obj; (void
 void mtl_upload(Dev *d, Tex *t, int face, int level) {
     @autoreleasepool {
     if (!t->mtl || !t->lock[face][level] || (t->usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))) return;
+    t->gen++;
     uint32_t w = t->w >> level ? t->w >> level : 1, h = t->h >> level ? t->h >> level : 1;
     int hb = fmt_host_bpp(t->fmt);
     uint8_t *tmp = malloc((size_t)w * h * (size_t)hb + 64);

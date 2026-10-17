@@ -57,6 +57,9 @@ uint32_t gsize(uint32_t p);
 uint32_t grealloc(uint32_t p, uint32_t size);
 uint32_t gvalloc(uint32_t size);                 /* page-granular, zeroed */
 uint32_t gstrdup(const char *s);
+typedef struct { uint32_t bump, vbump, free_lists[96]; } GHeapState;
+void gheap_get_state(GHeapState *st);
+void gheap_set_state(const GHeapState *st);
 
 extern int g_trace_imports;
 extern char g_game_dir[1024];

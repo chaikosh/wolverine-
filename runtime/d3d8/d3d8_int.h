@@ -61,6 +61,7 @@ typedef struct Tex {
     uint32_t surf[6][16];       /* guest surface objects */
     int dirty;
     int hud;                    /* created while loading logan_hud.all */
+    uint32_t gen;               /* bumped on every upload (save states re-upload changed textures) */
     char src[24];               /* .all file the texture was created from */
 } Tex;
 

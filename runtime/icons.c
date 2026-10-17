@@ -139,10 +139,32 @@ static void pause_icon(void) {
     rrect(56, 20, 72, 80, 4);
 }
 
+static void save_icon(void) {   /* floppy disk: quick save */
+    rrect(16, 14, 84, 86, 9);
+    ink(0);
+    tri(64, 10, 90, 10, 90, 36);                 /* clipped corner */
+    rrect(30, 14, 62, 40, 3);                     /* metal shutter */
+    rrect(26, 54, 74, 86, 5);                     /* label */
+    ink(1);
+    rrect(49, 19, 57, 35, 2);
+    seg(34, 64, 66, 64, 3.5); seg(34, 74, 58, 74, 3.5);
+}
+
+static void load_icon(void) {   /* arrow turning back around a clock: return to the saved moment */
+    const CGFloat d = (CGFloat)M_PI / 180, cx = 52, cy = 52, r = 32;
+    CGContextSetLineWidth(C, 9); CGContextSetLineCap(C, kCGLineCapButt);
+    CGContextAddArc(C, cx, cy, r, 200 * d, 520 * d, 0);
+    CGContextStrokePath(C);
+    CGFloat a = 200 * d, px = cx + r * cos(a), py = cy + r * sin(a), tx = sin(a), ty = -cos(a), nx = cos(a), ny = sin(a);
+    tri(px + tx * 15, py + ty * 15, px + nx * 12, py + ny * 12, px - nx * 12, py - ny * 12);
+    seg(cx, cy, cx, cy - 18, 7);
+    seg(cx, cy, cx + 14, cy + 8, 7);
+}
+
 static void (*const DRAW[ICON_COUNT])(void) = {
     [ICON_PUNCH] = punch, [ICON_KICK] = kick, [ICON_JUMP] = jump, [ICON_ACTION] = action, [ICON_CLAWS] = claws,
     [ICON_CROUCH] = crouch, [ICON_SENSES] = senses, [ICON_STEALTH] = stealth, [ICON_CAMERA] = camera,
-    [ICON_PAUSE] = pause_icon,
+    [ICON_PAUSE] = pause_icon, [ICON_SAVE] = save_icon, [ICON_LOAD] = load_icon,
 };
 
 void icons_render(uint8_t *px, int cell) {

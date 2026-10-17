@@ -2,6 +2,7 @@
 #include "platform.h"
 #include "runtime.h"
 #include "touch.h"
+#include "savestate.h"
 #include <SDL3/SDL.h>
 #include <TargetConditionals.h>
 #include <stdlib.h>
@@ -27,14 +28,29 @@ static void push_key(uint8_t dik, int down) {
     g_kq[g_kqt] = (KeyEvt){dik, (uint8_t)down, (uint32_t)SDL_GetTicks()};
     g_kqt = n;
 }
-void plat_key(uint8_t dik, int down) {
+static uint32_t vk_of(SDL_Keycode k, uint8_t dik);
+/* F5 quick save, F9 quick load (keyboard and test scripts); the game never sees these keys. */
+static int ss_key(uint8_t dik, int down) {
+    if (dik != 0x3F && dik != 0x43) return 0;
+    if (down) ss_request(dik == 0x3F ? SS_SAVE : SS_LOAD);
+    return 1;
+}
+void plat_key(uint8_t dik, int down) {   /* same path as a physical key: DirectInput state + buffer + WM_KEYDOWN/UP */
+    if (ss_key(dik, down)) return;
     g_dik_state[dik] = down ? 0x80 : 0;
     push_key(dik, down);
-    uint32_t vk = dik == 0x01 ? 0x1B : dik == 0x1C ? 0x0D : 0;
+    uint32_t vk = vk_of(0, dik);
     if (vk) plat_push_msg(down ? 0x0100 : 0x0101, vk, ((uint32_t)dik << 16) | 1u);
 }
 static WinMsg g_q[256];
 static int g_qh, g_qt;
+
+/* After a quick load: drop queued input that belongs to the abandoned timeline. */
+void plat_ss_flush_input(void) {
+    g_kqh = g_kqt; g_qh = g_qt;
+    memset(g_dik_state, 0, sizeof g_dik_state);
+    g_mouse_dx = g_mouse_dy = g_mouse_wheel = 0;
+}
 
 void plat_push_msg(uint32_t msg, uint32_t w, uint32_t l) {
     int n = (g_qt + 1) & 255;
@@ -93,6 +109,10 @@ static uint8_t dik_of(SDL_Scancode s) {
 static uint32_t vk_of(SDL_Keycode k, uint8_t dik) {
     if (k >= 'a' && k <= 'z') return (uint32_t)(k - 32);
     if (k >= '0' && k <= '9') return (uint32_t)k;
+    if (!k) {   /* scripted/touch keys: derive letters and digits from the US scancode layout */
+        static const char rows[] = "1234567890\0\0\0\0QWERTYUIOP\0\0\0\0ASDFGHJKL\0\0\0\0\0ZXCVBNM";
+        if (dik >= 0x02 && dik < 0x02 + sizeof rows - 1 && rows[dik - 0x02]) return (uint32_t)rows[dik - 0x02];
+    }
     switch (dik) {
     case 0x01: return 0x1B; case 0x1C: return 0x0D; case 0x39: return 0x20; case 0x0E: return 0x08; case 0x0F: return 0x09;
     case 0xC8: return 0x26; case 0xD0: return 0x28; case 0xCB: return 0x25; case 0xCD: return 0x27;
@@ -209,8 +229,8 @@ static void autokeys(void) {
     float t = (SDL_GetTicks() - t0) / 1000.f;
     for (int i = 0; i < n; i++) {
         uint8_t d = (uint8_t)key[i];
-        if (state[i] == 0 && t >= at[i]) { state[i] = 1; g_dik_state[d] = 0x80; push_key(d, 1); LOG("[auto] key %02X down at %.1fs\n", d, t); }
-        else if (state[i] == 1 && t >= at[i] + hold[i]) { state[i] = 2; g_dik_state[d] = 0; push_key(d, 0); }
+        if (state[i] == 0 && t >= at[i]) { state[i] = 1; plat_key(d, 1); LOG("[auto] key %02X down at %.1fs\n", d, t); }
+        else if (state[i] == 1 && t >= at[i] + hold[i]) { state[i] = 2; plat_key(d, 0); }
     }
 }
 
@@ -254,6 +274,7 @@ int plat_pump(void) {
         case SDL_EVENT_KEY_UP: {
             uint8_t d = dik_of(e.key.scancode);
             int down = e.type == SDL_EVENT_KEY_DOWN;
+            if (!e.key.repeat && ss_key(d, down)) break;
             if (d) { g_dik_state[d] = down ? 0x80 : 0; if (!e.key.repeat) push_key(d, down); }
             uint32_t vk = vk_of(e.key.key, d);
             if (vk && !e.key.repeat) plat_push_msg(down ? 0x0100 : 0x0101, vk, ((uint32_t)d << 16) | 1u);
