@@ -6,6 +6,7 @@
 #include "d3d8_shaders.h"
 #include "../platform.h"
 #include "../touch.h"
+#include "../icons.h"
 
 #define RING_SIZE (32u << 20)
 #define FRAMES 3
@@ -33,10 +34,10 @@ static void cache_put(Cache *c, uint64_t k, id obj) {
     CAMetalLayer *layer;
     SDL_MetalView view;
     id<MTLLibrary> lib;
-    id<MTLTexture> white, bb_color, bb_depth, gamma;
+    id<MTLTexture> white, bb_color, bb_depth, gamma, icons;
     id<MTLTexture> cur_color, cur_depth;
     id<MTLRenderPipelineState> blit_pso, ui_pso;
-    id<MTLSamplerState> blit_samp;
+    id<MTLSamplerState> blit_samp, icon_samp;
     id<MTLCommandBuffer> cmd;
     id<MTLRenderCommandEncoder> enc;
     int clear_pending; uint32_t clear_flags; MTLClearColor cc; double cz; uint32_t cs;
@@ -111,6 +112,25 @@ void mtl_init(Dev *d) {
     ud.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
     ud.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     m->ui_pso = [m->dev newRenderPipelineStateWithDescriptor:ud error:&err];
+    if (touch_enabled()) {   /* button pictograms: one atlas, mipmapped so small buttons stay smooth */
+        const int cell = 256, iw = cell * ICON_COLS, ih = cell * ICON_ROWS;
+        uint8_t *px = calloc((size_t)iw * ih, 1);
+        icons_render(px, cell);
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                                                     width:iw height:ih mipmapped:YES];
+        m->icons = [m->dev newTextureWithDescriptor:td];
+        [m->icons replaceRegion:MTLRegionMake2D(0, 0, iw, ih) mipmapLevel:0 withBytes:px bytesPerRow:iw];
+        free(px);
+        id<MTLCommandBuffer> cb = [m->q commandBuffer];
+        id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+        [be generateMipmapsForTexture:m->icons];
+        [be endEncoding];
+        [cb commit];
+        MTLSamplerDescriptor *isd = [MTLSamplerDescriptor new];
+        isd.minFilter = isd.magFilter = MTLSamplerMinMagFilterLinear;
+        isd.mipFilter = MTLSamplerMipFilterLinear;
+        m->icon_samp = [m->dev newSamplerStateWithDescriptor:isd];
+    }
     LOG("[mtl] %s, backbuffer %ux%u\n", m->dev.name.UTF8String, d->bbw, d->bbh);
 }
 
@@ -740,6 +760,8 @@ void mtl_present(Dev *d) {
                 [e setRenderPipelineState:m->ui_pso];
                 [e setVertexBytes:ui length:sizeof(UIInst) * (NSUInteger)nui atIndex:0];
                 [e setVertexBytes:scr length:sizeof scr atIndex:1];
+                [e setFragmentTexture:m->icons ? m->icons : m->white atIndex:0];
+                [e setFragmentSamplerState:m->icon_samp ? m->icon_samp : m->blit_samp atIndex:0];
                 [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:(NSUInteger)nui];
             }
             [e endEncoding];

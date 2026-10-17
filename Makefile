@@ -8,7 +8,7 @@ PY       := .venv/bin/python
 CC       := clang
 OPT      ?= -O1
 CFLAGS   := $(OPT) -g -fno-strict-aliasing -fwrapv -w -Iruntime -I$(GEN) -I/opt/homebrew/include
-LDFLAGS  := -Wl,-export_dynamic -L/opt/homebrew/lib -lSDL3 -lavformat -lavcodec -lswscale -lswresample -lavutil -framework Metal -framework QuartzCore -framework Foundation -framework GameController
+LDFLAGS  := -Wl,-export_dynamic -L/opt/homebrew/lib -lSDL3 -lavformat -lavcodec -lswscale -lswresample -lavutil -framework Metal -framework QuartzCore -framework CoreGraphics -framework Foundation -framework GameController
 
 RT_SRC   := $(wildcard runtime/*.c runtime/win32/*.c runtime/d3d8/*.c)
 RT_OBJC  := $(wildcard runtime/*.m runtime/d3d8/*.m)
